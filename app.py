@@ -1,0 +1,487 @@
+# app.py - Final verzija sa direktnim preuzimanjem (bez dodatnog klika)
+
+import streamlit as st
+import pandas as pd
+import datetime
+import requests
+import re
+from docxtpl import DocxTemplate
+from io import BytesIO
+import os
+import base64
+
+st.set_page_config(page_title="Generator Obavestenja", page_icon="📄", layout="wide")
+
+st.title("📄 Generator obaveštenja-Advokati Popović/Botorić ")
+st.markdown("")
+st.markdown("---")
+
+# ============================================
+# FUNKCIJA ZA OBRAČUN KAMATE
+# ============================================
+
+def izracunaj_kamatu(glavnica, datum_pocetka, datum_zavrsetka, kamatna_stopa):
+    if glavnica <= 0 or datum_pocetka is None:
+        return 0.0
+    
+    if isinstance(datum_pocetka, str):
+        for fmt in ['%d.%m.%Y.', '%d.%m.%Y', '%Y-%m-%d', '%m.%d.%Y.', '%m/%d/%Y']:
+            try:
+                datum_pocetka = datetime.datetime.strptime(datum_pocetka.strip(), fmt).date()
+                break
+            except:
+                continue
+        if isinstance(datum_pocetka, str):
+            return 0.0
+    elif isinstance(datum_pocetka, datetime.datetime):
+        datum_pocetka = datum_pocetka.date()
+    
+    if isinstance(datum_zavrsetka, datetime.datetime):
+        datum_zavrsetka = datum_zavrsetka.date()
+    else:
+        datum_zavrsetka = datetime.date.today()
+    
+    if datum_pocetka > datum_zavrsetka:
+        return 0.0
+    
+    def je_prestupna(godina):
+        return (godina % 4 == 0 and godina % 100 != 0) or (godina % 400 == 0)
+    
+    ukupna_kamata = 0.0
+    trenutni_datum = datum_pocetka
+    preostali_dani = (datum_zavrsetka - datum_pocetka).days
+    
+    if preostali_dani <= 0:
+        return 0.0
+    
+    while preostali_dani > 0:
+        godina = trenutni_datum.year
+        broj_dana_u_godini = 366 if je_prestupna(godina) else 365
+        kraj_godine = datetime.date(godina, 12, 31)
+        
+        if trenutni_datum <= kraj_godine:
+            if datum_zavrsetka <= kraj_godine:
+                dani_u_periodu = preostali_dani
+            else:
+                dani_u_periodu = (kraj_godine - trenutni_datum).days + 1
+        else:
+            dani_u_periodu = 0
+        
+        if dani_u_periodu > 0:
+            kamata_za_godinu = (glavnica * kamatna_stopa * dani_u_periodu) / (100 * broj_dana_u_godini)
+            ukupna_kamata += kamata_za_godinu
+        
+        preostali_dani -= dani_u_periodu
+        trenutni_datum = datetime.date(godina + 1, 1, 1)
+    
+    return ukupna_kamata
+
+def dohvati_kamatnu_stopu():
+    try:
+        url = "https://www.nbs.rs/sr_RS/druge/instrumenti-politike/kamatne-stope/"
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            text = response.text
+            match = re.search(r'(\d+,\d+)\s*%', text)
+            if match:
+                return float(match.group(1).replace(',', '.'))
+        return 6.00
+    except:
+        return 6.00
+
+def formatiraj_iznos(iznos):
+    if iznos is None:
+        iznos = 0
+    return f"{iznos:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+def ucitaj_sve_sheetove(fajl):
+    """Učitava sve sheet-ove iz Excel fajla osim onih koje ignorišemo"""
+    ignore_sheets = ['SVI PREDMETI', 'ROČIŠTA', 'BEXX BALKAN', 'UNIQA', 'OSIGURANJE', 'BANKE', 'IZVRŠENJE-BALKAN']
+    try:
+        excel_file = pd.ExcelFile(fajl)
+        sheets = [s for s in excel_file.sheet_names if s not in ignore_sheets]
+        return excel_file, sheets
+    except Exception as e:
+        st.error(f"Greška: {e}")
+        return None, []
+
+def pronadji_kolone(df):
+    """Pronalazi odgovarajuće kolone u dataframe-u"""
+    kolona_ime = None
+    kolona_dug = None
+    kolona_datum = None
+    kolona_ulica = None
+    
+    for col in df.columns:
+        col_str = str(col).strip().lower()
+        if 'ime' in col_str or 'duznik' in col_str or 'dužnik' in col_str:
+            kolona_ime = col
+        if 'osnovnog' in col_str or 'duga' in col_str or 'iznos' in col_str:
+            kolona_dug = col
+        if 'datum' in col_str or 'naloga' in col_str:
+            kolona_datum = col
+        if 'ulica' in col_str or 'adresa' in col_str:
+            kolona_ulica = col
+    
+    # Fallback na pozicije
+    if kolona_ime is None and len(df.columns) > 1:
+        kolona_ime = df.columns[1]
+    if kolona_dug is None and len(df.columns) > 3:
+        kolona_dug = df.columns[3]
+    if kolona_datum is None and len(df.columns) > 21:
+        kolona_datum = df.columns[21]
+    
+    return kolona_ime, kolona_dug, kolona_datum, kolona_ulica
+
+def parsiraj_datum(datum):
+    if datum is None:
+        return None
+    if isinstance(datum, (datetime.datetime, datetime.date)):
+        return datum.date() if isinstance(datum, datetime.datetime) else datum
+    if isinstance(datum, str):
+        datum = datum.strip()
+        formati = ['%d.%m.%Y.', '%d.%m.%Y', '%Y-%m-%d', '%m.%d.%Y.', '%m/%d/%Y']
+        for fmt in formati:
+            try:
+                return datetime.datetime.strptime(datum.split()[0], fmt).date()
+            except:
+                continue
+    return None
+
+def ucitaj_duznike_iz_sheeta(excel_file, sheet_name):
+    """Učitava sve dužnike iz jednog sheet-a"""
+    try:
+        df = excel_file.parse(sheet_name)
+        kolona_ime, kolona_dug, kolona_datum, kolona_ulica = pronadji_kolone(df)
+        
+        duznici = []
+        for idx, row in df.iterrows():
+            if idx < 2:
+                continue
+            
+            ime = row[kolona_ime] if kolona_ime and pd.notna(row[kolona_ime]) else None
+            if ime and isinstance(ime, str):
+                ime = ime.strip()
+                if ime == 'Ime dužnika' or len(ime) < 2:
+                    continue
+            else:
+                continue
+            
+            iznos = row[kolona_dug] if kolona_dug and pd.notna(row[kolona_dug]) else None
+            if iznos is not None:
+                try:
+                    if isinstance(iznos, str):
+                        iznos = float(iznos.replace(',', '.'))
+                    else:
+                        iznos = float(iznos)
+                except:
+                    iznos = None
+            
+            datum = row[kolona_datum] if kolona_datum and pd.notna(row[kolona_datum]) else None
+            datum_obj = parsiraj_datum(datum)
+            
+            ulica = row[kolona_ulica] if kolona_ulica and pd.notna(row[kolona_ulica]) else ''
+            
+            duznici.append({
+                'ime_prezime': ime,
+                'iznos_osnovnog_duga': iznos,
+                'datum_naloga': datum_obj,
+                'ulica': ulica,
+                'grad': sheet_name.upper(),
+                'sheet': sheet_name
+            })
+        
+        return duznici
+    except Exception as e:
+        st.warning(f"Greška pri učitavanju {sheet_name}: {e}")
+        return []
+
+def generisi_word_duzniku(duznik, kamatna_stopa, template_putanja):
+    """Generiše Word dokument za jednog dužnika"""
+    try:
+        danas = datetime.date.today()
+        
+        ime = duznik['ime_prezime']
+        iznos = duznik['iznos_osnovnog_duga']
+        datum = duznik['datum_naloga']
+        ulica = duznik.get('ulica', '')
+        grad = duznik.get('grad', '')
+        
+        # Formatiranje za bold i velika slova
+        ime_formatirano = ime.upper() if ime else ""
+        ulica_formatirano = ulica.upper() if ulica else "_______________"
+        grad_formatirano = grad.upper() if grad else ""
+
+        if iznos is None or iznos <= 0:
+            return None, "Nedostaje iznos duga"
+        
+        if datum:
+            kamata = izracunaj_kamatu(iznos, datum, danas, kamatna_stopa)
+            datum_str = datum.strftime('%d.%m.%Y.')
+        else:
+            kamata = 0
+            datum_str = "_____"
+        
+        ukupan_dug = iznos + kamata + 5000.0
+        
+        podaci = {
+            'ime_prezime': ime,
+            'ulica': ulica if ulica else "_______________",
+            'grad': grad,
+            'iznos_osnovnog_duga': formatiraj_iznos(iznos),
+            'datum_naloga': datum_str,
+            'obracun_kamate': formatiraj_iznos(kamata),
+            'iznos_ukupnog_duga': formatiraj_iznos(ukupan_dug)
+        }
+        
+        if os.path.exists(template_putanja):
+            doc = DocxTemplate(template_putanja)
+            doc.render(podaci)
+
+            # Nakon renderovanja, primeni bold na prva 3 paragrafa
+            for i, paragraph in enumerate(doc.paragraphs[:3]):  # Prva 3 paragrafa
+                for run in paragraph.runs:
+                    run.bold = True
+            
+            doc_bytes = BytesIO()
+            doc.save(doc_bytes)
+            doc_bytes.seek(0)
+            return doc_bytes, None
+        else:
+            return None, "Template fajl nije pronađen"
+    except Exception as e:
+        return None, str(e)
+
+def generisi_sve_duznike(duznici, kamatna_stopa, template_putanja, progress_bar):
+    """Generiše Word dokumente za sve dužnike u batch modu"""
+    rezultati = []
+    for i, duznik in enumerate(duznici):
+        doc_bytes, greska = generisi_word_duzniku(duznik, kamatna_stopa, template_putanja)
+        if doc_bytes:
+            rezultati.append((duznik['ime_prezime'], doc_bytes))
+        progress_bar.progress((i + 1) / len(duznici))
+    return rezultati
+
+def auto_download(doc_bytes, filename):
+    """Automatsko preuzimanje fajla"""
+    b64 = base64.b64encode(doc_bytes.getvalue()).decode()
+    href = f'<a href="data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,{b64}" download="{filename}" id="download-link" style="display:none">Download</a>'
+    st.markdown(href, unsafe_allow_html=True)
+    st.markdown(f"""
+        <script>
+            document.getElementById('download-link').click();
+        </script>
+    """, unsafe_allow_html=True)
+
+# ============================================
+# GLAVNI DEO APLIKACIJE
+# ============================================
+
+def main():
+    with st.sidebar:
+        st.header("📂 1. Upload Excel fajla")
+        uploaded_file = st.file_uploader("Izaberite Excel fajl", type=['xlsx', 'xls'])
+        
+        if uploaded_file:
+            excel_file, sheets = ucitaj_sve_sheetove(uploaded_file)
+            st.session_state['excel_file'] = excel_file
+            st.session_state['sheets'] = sheets
+            st.success(f"Pronađeno {len(sheets)} sheet-ova")
+        
+        st.markdown("---")
+        st.header("⚙️ 2. Podešavanja")
+        
+        nacin_kamate = st.radio("Kamatna stopa:", ["Automatski (NBS)", "Ručno"])
+        
+        if nacin_kamate == "Ručno":
+            kamatna_stopa = st.number_input("Stopa (%)", min_value=0.0, max_value=50.0, value=6.0, step=0.25)
+        else:
+            kamatna_stopa = dohvati_kamatnu_stopu()
+            st.info(f"📊 Trenutna stopa: {kamatna_stopa}%")
+            if st.button("🔄 Osveži"):
+                st.rerun()
+        
+        st.markdown("---")
+        st.header("🎯 3. Način rada")
+        mode = st.radio("Izaberite način rada:", ["Pojedinačni dužnik", "Batch (više dužnika)"])
+    
+    if uploaded_file is None:
+        st.info("👈 **Korak 1:** Izaberite Excel fajl sa leve strane")
+        st.markdown("""
+        ### 
+        
+        ### Kolone koje program prepoznaje:
+        - **Ime dužnika** (kolona sa rečju 'ime' ili 'duznik')
+        - **Iznos osnovnog duga** (kolona sa rečju 'iznos' ili 'dug')
+        - **Datum naloga** (kolona sa rečju 'datum')
+        - **Ulica** (kolona sa rečju 'ulica' ili 'adresa') - opciono
+        """)
+        return
+    
+    excel_file = st.session_state.get('excel_file')
+    sheets = st.session_state.get('sheets', [])
+    
+    if not sheets:
+        st.error("Nema dostupnih sheet-ova!")
+        return
+    
+    st.header("🏙️ 4. Izaberite grad (sheet)")
+    izabrani_sheet = st.selectbox("Grad:", sheets)
+    
+    if 'duznici_cache' not in st.session_state or st.session_state.get('last_sheet') != izabrani_sheet:
+        with st.spinner(f"Učitavam dužnike iz {izabrani_sheet}..."):
+            duznici = ucitaj_duznike_iz_sheeta(excel_file, izabrani_sheet)
+            st.session_state['duznici'] = duznici
+            st.session_state['last_sheet'] = izabrani_sheet
+    
+    duznici = st.session_state.get('duznici', [])
+    
+    if not duznici:
+        st.warning(f"Nema podataka o dužnicima u sheet-u '{izabrani_sheet}'")
+        return
+    
+    if mode == "Pojedinačni dužnik":
+        st.header("👤 5. Izbor dužnika")
+        
+        opcije = [f"{d['ime_prezime']} ({izabrani_sheet})" for d in duznici]
+        izabrani_index = st.selectbox("Izaberite dužnika:", range(len(opcije)), format_func=lambda x: opcije[x])
+        duznik = duznici[izabrani_index].copy()
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("📋 Podaci iz Excel-a")
+            st.write(f"**Ime i prezime:** {duznik['ime_prezime']}")
+            
+            if duznik['iznos_osnovnog_duga'] is None or duznik['iznos_osnovnog_duga'] <= 0:
+                iznos_rucno = st.number_input("Iznos osnovnog duga (RSD):", min_value=0.0, value=1000.0, step=100.0)
+                duznik['iznos_osnovnog_duga'] = iznos_rucno
+                st.info("✏️ Iznos unet ručno")
+            else:
+                st.write(f"**Iznos osnovnog duga:** {formatiraj_iznos(duznik['iznos_osnovnog_duga'])} RSD")
+                popravi_iznos = st.checkbox("Popravi iznos ručno")
+                if popravi_iznos:
+                    iznos_rucno = st.number_input("Ispravite iznos (RSD):", min_value=0.0, value=float(duznik['iznos_osnovnog_duga']), step=100.0)
+                    duznik['iznos_osnovnog_duga'] = iznos_rucno
+            
+            if duznik['datum_naloga']:
+                st.write(f"**Datum naloga:** {duznik['datum_naloga'].strftime('%d.%m.%Y.')}")
+                popravi_datum = st.checkbox("Popravi datum ručno")
+                if popravi_datum:
+                    datum_rucno = st.date_input("Izaberite datum:", value=duznik['datum_naloga'])
+                    duznik['datum_naloga'] = datum_rucno
+            else:
+                st.warning("⚠️ Datum naloga nije pronađen!")
+                datum_rucno = st.date_input("Unesite datum naloga:", value=datetime.date.today())
+                duznik['datum_naloga'] = datum_rucno
+                st.info("✏️ Datum unet ručno")
+        
+        with col2:
+            st.subheader("🏠 Adresa")
+            ulica = st.text_input("Ulica i broj:", value=duznik.get('ulica', ''), placeholder="Npr. Kralja Petra 10")
+            grad = st.text_input("Grad:", value=izabrani_sheet.upper())
+            duznik['ulica'] = ulica
+            duznik['grad'] = grad
+        
+        st.markdown("---")
+        st.header("💰 Obračun kamate")
+        
+        danas = datetime.date.today()
+        if duznik['datum_naloga'] and duznik['iznos_osnovnog_duga'] > 0:
+            kamata = izracunaj_kamatu(duznik['iznos_osnovnog_duga'], duznik['datum_naloga'], danas, kamatna_stopa)
+        else:
+            kamata = 0
+        
+        ukupan_dug = duznik['iznos_osnovnog_duga'] + kamata + 5000.0
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Osnovni dug", f"{formatiraj_iznos(duznik['iznos_osnovnog_duga'])} RSD")
+        with col2:
+            st.metric("Obračunata kamata", f"{formatiraj_iznos(kamata)} RSD", delta=f"stopa: {kamatna_stopa}%", delta_color="off")
+        with col3:
+            st.metric("Troškovi", "5.000,00 RSD")
+        
+        st.markdown("---")
+        st.markdown(f"## 💰 UKUPNO ZA UPLATU: {formatiraj_iznos(ukupan_dug)} RSD")
+        
+        if st.button("📄 GENERIŠI I PREUZMI", type="primary", use_container_width=True):
+             with st.spinner("Generišem dokument..."):
+                doc_bytes, greska = generisi_word_duzniku(duznik, kamatna_stopa, "template.docx")
+                if doc_bytes:
+                    st.success("✅ Dokument generisan - preuzimanje počinje!")
+                    st.download_button(
+                        label="💾 PREUZMI DOKUMENT",
+                        data=doc_bytes,
+                        file_name=f"obavestenje_{duznik['ime_prezime'].replace(' ', '_')}.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        use_container_width=True
+                    )
+                    st.info("Kliknite na dugme iznad za preuzimanje.")    
+                else:
+                    st.error(f"Greška: {greska}")
+    
+    else:
+        st.header("📦 Batch generisanje")
+        
+        st.subheader("Izaberite dužnike:")
+        
+        izabrani_duznici = []
+        for i, d in enumerate(duznici[:100]):  # Ograniči na prvih 100 radi performansi
+            col1, col2 = st.columns([5, 2])
+            with col1:
+                selected = st.checkbox(f"{d['ime_prezime']} - {formatiraj_iznos(d['iznos_osnovnog_duga']) if d['iznos_osnovnog_duga'] else 'bez iznosa'} RSD", key=f"batch_{i}")
+            with col2:
+                if d['datum_naloga']:
+                    st.write(d['datum_naloga'].strftime('%d.%m.%Y.'))
+                else:
+                    st.write("bez datuma")
+            if selected:
+                d['grad'] = izabrani_sheet.upper()
+                izabrani_duznici.append(d)
+        
+        if len(duznici) > 100:
+            st.info(f"Prikazano prvih 100 od {len(duznici)} dužnika. Za batch sa više dužnika, filtriraj podatke u Excel-u.")
+        
+        if izabrani_duznici:
+            st.info(f"Izabrano {len(izabrani_duznici)} dužnika")
+            
+            batch_ulica = st.text_input("Ulica (zajednička za sve):", placeholder="Ostavi prazno za ulicu iz Excel-a")
+            
+            if st.button("🚀 GENERIŠI SVE", type="primary", use_container_width=True):
+                with st.spinner(f"Generišem {len(izabrani_duznici)} dokumenata..."):
+                    for d in izabrani_duznici:
+                        if batch_ulica:
+                            d['ulica'] = batch_ulica
+                    
+                    from zipfile import ZipFile
+                    zip_bytes = BytesIO()
+                    uspesno = 0
+                    
+                    with ZipFile(zip_bytes, 'w') as zipf:
+                        for i, duznik in enumerate(izabrani_duznici):
+                            doc_bytes, greska = generisi_word_duzniku(duznik, kamatna_stopa, "template.docx")
+                            if doc_bytes:
+                                zipf.writestr(f"obavestenje_{duznik['ime_prezime'].replace(' ', '_')}.docx", doc_bytes.getvalue())
+                                uspesno += 1
+                    
+                    if uspesno > 0:
+                        zip_bytes.seek(0)
+                        st.success(f"✅ Uspešno generisano {uspesno} od {len(izabrani_duznici)} dokumenata")
+                        
+                        b64 = base64.b64encode(zip_bytes.getvalue()).decode()
+                        href = f'<a href="data:application/zip;base64,{b64}" download="obavestenja_{izabrani_sheet}_{datetime.date.today()}.zip" id="download-link" style="display:none">Download</a>'
+                        st.markdown(href, unsafe_allow_html=True)
+                        st.markdown("""
+                            <script>
+                                document.getElementById('download-link').click();
+                            </script>
+                        """, unsafe_allow_html=True)
+                        st.stop()
+                    else:
+                        st.error("Nijedan dokument nije uspešno generisan!")
+        else:
+            st.info("Izaberite dužnike za generisanje")
+
+if __name__ == "__main__":
+    main()
