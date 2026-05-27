@@ -231,7 +231,9 @@ def generisi_word_duzniku(duznik, kamatna_stopa, template_putanja):
             'iznos_osnovnog_duga': formatiraj_iznos(iznos),
             'datum_naloga': datum_str,
             'obracun_kamate': formatiraj_iznos(kamata),
-            'iznos_ukupnog_duga': formatiraj_iznos(ukupan_dug)
+            'iznos_ukupnog_duga': formatiraj_iznos(ukupan_dug),
+            'datum': datetime.date.today().strftime('%d.%m.%Y.')
+            
         }
         
         if os.path.exists(template_putanja):
