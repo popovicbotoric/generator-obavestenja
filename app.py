@@ -77,18 +77,28 @@ def izracunaj_kamatu(glavnica, datum_pocetka, datum_zavrsetka, kamatna_stopa):
     return ukupna_kamata
 
 def dohvati_kamatnu_stopu():
+    """
+    Dohvata referentnu kamatnu stopu sa NBS sajta i izračunava zakonsku zateznu kamatu.
+    Formula: Zakonska zatezna kamata = Referentna stopa + 8 procentnih poena
+    """
     try:
         url = "https://www.nbs.rs/sr_RS/druge/instrumenti-politike/kamatne-stope/"
         response = requests.get(url, timeout=10)
         if response.status_code == 200:
             text = response.text
+            # Traži referentnu stopu (prvi veći procenat na stranici)
             match = re.search(r'(\d+,\d+)\s*%', text)
             if match:
-                return float(match.group(1).replace(',', '.'))
-        return 6.00
+                referentna_stopa = float(match.group(1).replace(',', '.'))
+                # Zakonska zatezna kamata = referentna stopa + 8 procentnih poena
+                zakonska_stopa = referentna_stopa + 8.0
+                return zakonska_stopa
+        # Ako ne uspe dohvatanje, vrati sigurnu default vrednost (13.75%)
+        return 13.75
     except:
-        return 6.00
-
+        # U slučaju bilo kakve greške, vrati sigurnu vrednost
+        return 13.75 
+    
 def formatiraj_iznos(iznos):
     if iznos is None:
         iznos = 0
