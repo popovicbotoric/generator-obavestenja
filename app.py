@@ -1,4 +1,4 @@
-# app.py - Final verzija sa direktnim preuzimanjem (bez dodatnog klika)
+# app.py - Kompletna verzija SA PODRŠKOM ZA ADRESU I JKP
 
 import streamlit as st
 import pandas as pd
@@ -9,12 +9,27 @@ from docxtpl import DocxTemplate
 from io import BytesIO
 import os
 import base64
+import traceback
 
 st.set_page_config(page_title="Generator Obavestenja", page_icon="📄", layout="wide")
 
 st.title("📄 Generator obaveštenja-Advokati Popović/Botorić ")
 st.markdown("")
 st.markdown("---")
+
+# ============================================
+# REČNIK GRADOVA I JKP
+# ============================================
+
+JKP_PO_GRADOVIMA = {
+    'KRALJEVO': 'JKP "Čistoća Kraljevo" Kraljevo',
+    'VALJEVO': 'JKP "Vidrak Valjevo" Valjevo',
+    'LAZAREVAC': 'JKP "Parking Servis" Lazarevac',
+    'GORNJI MILANOVAC': 'JKP "JP za izgradnju opštine Gornji Milanovac" Gornji Milanovac',
+    'IVANJICA': 'JKP "Ivanjica" Ivanjica',
+    
+    # Dodaj ostale gradove po potrebi
+}
 
 # ============================================
 # FUNKCIJA ZA OBRAČUN KAMATE
@@ -77,26 +92,18 @@ def izracunaj_kamatu(glavnica, datum_pocetka, datum_zavrsetka, kamatna_stopa):
     return ukupna_kamata
 
 def dohvati_kamatnu_stopu():
-    """
-    Dohvata referentnu kamatnu stopu sa NBS sajta i izračunava zakonsku zateznu kamatu.
-    Formula: Zakonska zatezna kamata = Referentna stopa + 8 procentnih poena
-    """
     try:
         url = "https://www.nbs.rs/sr_RS/druge/instrumenti-politike/kamatne-stope/"
         response = requests.get(url, timeout=10)
         if response.status_code == 200:
             text = response.text
-            # Traži referentnu stopu (prvi veći procenat na stranici)
             match = re.search(r'(\d+,\d+)\s*%', text)
             if match:
                 referentna_stopa = float(match.group(1).replace(',', '.'))
-                # Zakonska zatezna kamata = referentna stopa + 8 procentnih poena
                 zakonska_stopa = referentna_stopa + 8.0
                 return zakonska_stopa
-        # Ako ne uspe dohvatanje, vrati sigurnu default vrednost (13.75%)
         return 13.75
     except:
-        # U slučaju bilo kakve greške, vrati sigurnu vrednost
         return 13.75 
     
 def formatiraj_iznos(iznos):
@@ -104,8 +111,97 @@ def formatiraj_iznos(iznos):
         iznos = 0
     return f"{iznos:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
+def parsiraj_broj_iz_stringa(vrednost):
+    """
+    Parsira broj iz stringa bez obzira na format.
+    Radi za: 1200, 1200.0, 1.500,00, 1,500.00, 1.500, itd.
+    """
+    if vrednost is None:
+        return None
+    
+    # Ako je već broj, vrati ga
+    if isinstance(vrednost, (int, float)):
+        return float(vrednost)
+    
+    # Pretvori u string
+    vrednost = str(vrednost).strip()
+    if not vrednost:
+        return None
+    
+    # Ukloni sve razmake
+    vrednost = vrednost.replace(" ", "")
+    
+    # Ako je prazno posle uklanjanja razmaka
+    if not vrednost:
+        return None
+    
+    # ====== PARSIRANJE ======
+    # 1. Format: 1.500,00 (srpski - tačka za hiljade, zarez za decimale)
+    if "." in vrednost and "," in vrednost:
+        if vrednost.index(".") < vrednost.index(","):
+            # Ukloni tačke (separatori hiljada)
+            vrednost = vrednost.replace(".", "")
+            # Zameni zarez sa tačkom (decimalni separator)
+            vrednost = vrednost.replace(",", ".")
+            try:
+                return float(vrednost)
+            except:
+                pass
+    
+    # 2. Format: 1,500.00 (engleski - zarez za hiljade, tačka za decimale)
+    if "," in vrednost and "." in vrednost:
+        if vrednost.index(",") < vrednost.index("."):
+            # Ukloni zareze (separatori hiljada)
+            vrednost = vrednost.replace(",", "")
+            try:
+                return float(vrednost)
+            except:
+                pass
+    
+    # 3. Format: 1234,56 (srpski - samo zarez kao decimalni separator)
+    if "," in vrednost:
+        if vrednost.count(",") == 1:
+            # To je verovatno decimalni separator
+            vrednost = vrednost.replace(",", ".")
+            try:
+                return float(vrednost)
+            except:
+                pass
+        else:
+            # Više zareza - verovatno separator hiljada
+            vrednost = vrednost.replace(",", "")
+            try:
+                return float(vrednost)
+            except:
+                pass
+    
+    # 4. Format: 1.500 (samo tačke kao separator hiljada)
+    if "." in vrednost:
+        if vrednost.count(".") > 1:
+            vrednost = vrednost.replace(".", "")
+            try:
+                return float(vrednost)
+            except:
+                pass
+    
+    # 5. Pokušaj direktno
+    try:
+        return float(vrednost)
+    except:
+        pass
+    
+    # 6. Poslednji pokušaj - izvuci sve brojeve i tačke
+    import re
+    cleaned = re.sub(r'[^\d.]', '', vrednost)
+    try:
+        if cleaned:
+            return float(cleaned)
+    except:
+        pass
+    
+    return None
+
 def ucitaj_sve_sheetove(fajl):
-    """Učitava sve sheet-ove iz Excel fajla osim onih koje ignorišemo"""
     ignore_sheets = ['SVI PREDMETI', 'ROČIŠTA', 'BEXX BALKAN', 'UNIQA', 'OSIGURANJE', 'BANKE', 'IZVRŠENJE-BALKAN']
     try:
         excel_file = pd.ExcelFile(fajl)
@@ -115,33 +211,122 @@ def ucitaj_sve_sheetove(fajl):
         st.error(f"Greška: {e}")
         return None, []
 
-def pronadji_kolone(df):
-    """Pronalazi odgovarajuće kolone u dataframe-u"""
-    kolona_ime = None
-    kolona_dug = None
-    kolona_datum = None
-    kolona_ulica = None
-    
-    for col in df.columns:
-        col_str = str(col).strip().lower()
-        if 'ime' in col_str or 'duznik' in col_str or 'dužnik' in col_str:
-            kolona_ime = col
-        if 'osnovnog' in col_str or 'duga' in col_str or 'iznos' in col_str:
-            kolona_dug = col
-        if 'datum' in col_str or 'naloga' in col_str:
-            kolona_datum = col
-        if 'ulica' in col_str or 'adresa' in col_str:
-            kolona_ulica = col
-    
-    # Fallback na pozicije
-    if kolona_ime is None and len(df.columns) > 1:
-        kolona_ime = df.columns[1]
-    if kolona_dug is None and len(df.columns) > 3:
-        kolona_dug = df.columns[3]
-    if kolona_datum is None and len(df.columns) > 21:
-        kolona_datum = df.columns[21]
-    
-    return kolona_ime, kolona_dug, kolona_datum, kolona_ulica
+def ucitaj_duznike_iz_sheeta(excel_file, sheet_name):
+    """Učitava sve dužnike iz jednog sheet-a UKLJUČUJUĆI ADRESU I JKP"""
+    try:
+        # Učitaj sve kao string - OVO JE KLJUČNO!
+        df = excel_file.parse(sheet_name, dtype=str, keep_default_na=False)
+        
+        # Pronađi kolonu sa imenom
+        kolona_ime = None
+        for col in df.columns:
+            col_str = str(col).strip().lower()
+            if 'ime' in col_str and ('dužn' in col_str or 'duzn' in col_str):
+                kolona_ime = col
+                break
+        
+        # Pronađi kolonu sa iznosom osnovnog duga
+        kolona_dug = None
+        for col in df.columns:
+            col_str = str(col).strip().lower()
+            if 'osnovnog' in col_str and ('dug' in col_str or 'iznos' in col_str):
+                kolona_dug = col
+                break
+        
+        # Ako nije pronađeno po nazivu, koristi poziciju (kolona C = indeks 3)
+        if kolona_dug is None and len(df.columns) > 3:
+            kolona_dug = df.columns[3]
+        
+        # Pronađi kolonu sa datumom (ako postoji)
+        kolona_datum = None
+        for col in df.columns:
+            col_str = str(col).strip().lower()
+            if 'datum' in col_str or 'naloga' in col_str:
+                kolona_datum = col
+                break
+        
+        # Pronađi kolonu sa ulicom/adresom
+        kolona_ulica = None
+        for col in df.columns:
+            col_str = str(col).strip().lower()
+            if 'ulica' in col_str or 'adresa' in col_str:
+                kolona_ulica = col
+                break
+        
+        # ===== DODAJ JKP ZA OVAJ SHEET =====
+        jkp = JKP_PO_GRADOVIMA.get(sheet_name.upper(), f'JKP "{sheet_name}"')
+        
+        duznici = []
+        
+        for idx, row in df.iterrows():
+            # Preskoči redove koji su prazni
+            if all(str(v).strip() == '' for v in row):
+                continue
+            
+            # Preskoči prva 2 reda (zaglavlje)
+            if idx < 2:
+                continue
+            
+            # Uzmi ime
+            ime = ''
+            if kolona_ime and kolona_ime in row:
+                ime = str(row[kolona_ime]).strip()
+            elif len(df.columns) > 1:
+                ime = str(row.iloc[1]).strip()
+            
+            # Preskoči ako nema ime ili je to zaglavlje
+            if not ime or len(ime) < 2:
+                continue
+            
+            # Preskoči redove koji su zaglavlja
+            if ime.lower() in ['ime dužnika', 'ime duznika', 'no.', 'redni broj', 'nan']:
+                continue
+            
+            # Uzmi iznos
+            iznos_raw = None
+            if kolona_dug and kolona_dug in row:
+                iznos_raw = str(row[kolona_dug]).strip()
+            
+            # Ako nema vrednosti, preskoči
+            if not iznos_raw or iznos_raw == '' or iznos_raw.lower() == 'nan':
+                continue
+            
+            # Parsiraj iznos
+            iznos = parsiraj_broj_iz_stringa(iznos_raw)
+            
+            # Ako nije uspešno parsiranje, preskoči
+            if iznos is None or iznos <= 0:
+                continue
+            
+            # Uzmi datum (ako postoji)
+            datum_obj = None
+            if kolona_datum and kolona_datum in row:
+                datum_raw = str(row[kolona_datum]).strip()
+                if datum_raw and datum_raw.lower() != 'nan':
+                    datum_obj = parsiraj_datum(datum_raw)
+            
+            # Uzmi ulicu
+            ulica = ''
+            if kolona_ulica and kolona_ulica in row:
+                ulica = str(row[kolona_ulica]).strip()
+                if ulica.lower() == 'nan':
+                    ulica = ''
+            
+            duznici.append({
+                'ime_prezime': ime,
+                'iznos_osnovnog_duga': iznos,
+                'datum_naloga': datum_obj,
+                'ulica': ulica,
+                'grad': sheet_name.upper(),
+                'sheet': sheet_name,
+                'jkp': jkp  # <--- DODATO JKP
+            })
+        
+        return duznici
+    except Exception as e:
+        st.warning(f"Greška pri učitavanju {sheet_name}: {e}")
+        st.code(traceback.format_exc())
+        return []
 
 def parsiraj_datum(datum):
     if datum is None:
@@ -158,56 +343,7 @@ def parsiraj_datum(datum):
                 continue
     return None
 
-def ucitaj_duznike_iz_sheeta(excel_file, sheet_name):
-    """Učitava sve dužnike iz jednog sheet-a"""
-    try:
-        df = excel_file.parse(sheet_name)
-        kolona_ime, kolona_dug, kolona_datum, kolona_ulica = pronadji_kolone(df)
-        
-        duznici = []
-        for idx, row in df.iterrows():
-            if idx < 2:
-                continue
-            
-            ime = row[kolona_ime] if kolona_ime and pd.notna(row[kolona_ime]) else None
-            if ime and isinstance(ime, str):
-                ime = ime.strip()
-                if ime == 'Ime dužnika' or len(ime) < 2:
-                    continue
-            else:
-                continue
-            
-            iznos = row[kolona_dug] if kolona_dug and pd.notna(row[kolona_dug]) else None
-            if iznos is not None:
-                try:
-                    if isinstance(iznos, str):
-                        iznos = float(iznos.replace(',', '.'))
-                    else:
-                        iznos = float(iznos)
-                except:
-                    iznos = None
-            
-            datum = row[kolona_datum] if kolona_datum and pd.notna(row[kolona_datum]) else None
-            datum_obj = parsiraj_datum(datum)
-            
-            ulica = row[kolona_ulica] if kolona_ulica and pd.notna(row[kolona_ulica]) else ''
-            
-            duznici.append({
-                'ime_prezime': ime,
-                'iznos_osnovnog_duga': iznos,
-                'datum_naloga': datum_obj,
-                'ulica': ulica,
-                'grad': sheet_name.upper(),
-                'sheet': sheet_name
-            })
-        
-        return duznici
-    except Exception as e:
-        st.warning(f"Greška pri učitavanju {sheet_name}: {e}")
-        return []
-
 def generisi_word_duzniku(duznik, kamatna_stopa, template_putanja):
-    """Generiše Word dokument za jednog dužnika"""
     try:
         danas = datetime.date.today()
         
@@ -216,11 +352,7 @@ def generisi_word_duzniku(duznik, kamatna_stopa, template_putanja):
         datum = duznik['datum_naloga']
         ulica = duznik.get('ulica', '')
         grad = duznik.get('grad', '')
-        
-        # Formatiranje za bold i velika slova
-        ime_formatirano = ime.upper() if ime else ""
-        ulica_formatirano = ulica.upper() if ulica else "_______________"
-        grad_formatirano = grad.upper() if grad else ""
+        jkp = duznik.get('jkp', 'JKP')  # <--- DODATO JKP
 
         if iznos is None or iznos <= 0:
             return None, "Nedostaje iznos duga"
@@ -238,20 +370,19 @@ def generisi_word_duzniku(duznik, kamatna_stopa, template_putanja):
             'ime_prezime': ime,
             'ulica': ulica if ulica else "_______________",
             'grad': grad,
+            'jkp': jkp,  # <--- DODATO JKP
             'iznos_osnovnog_duga': formatiraj_iznos(iznos),
             'datum_naloga': datum_str,
             'obracun_kamate': formatiraj_iznos(kamata),
             'iznos_ukupnog_duga': formatiraj_iznos(ukupan_dug),
             'datum': datetime.date.today().strftime('%d.%m.%Y.')
-            
         }
         
         if os.path.exists(template_putanja):
             doc = DocxTemplate(template_putanja)
             doc.render(podaci)
-
-            # Nakon renderovanja, primeni bold na prva 3 paragrafa
-            for i, paragraph in enumerate(doc.paragraphs[:3]):  # Prva 3 paragrafa
+            
+            for i, paragraph in enumerate(doc.paragraphs[:3]):
                 for run in paragraph.runs:
                     run.bold = True
             
@@ -265,7 +396,6 @@ def generisi_word_duzniku(duznik, kamatna_stopa, template_putanja):
         return None, str(e)
 
 def generisi_sve_duznike(duznici, kamatna_stopa, template_putanja, progress_bar):
-    """Generiše Word dokumente za sve dužnike u batch modu"""
     rezultati = []
     for i, duznik in enumerate(duznici):
         doc_bytes, greska = generisi_word_duzniku(duznik, kamatna_stopa, template_putanja)
@@ -273,17 +403,6 @@ def generisi_sve_duznike(duznici, kamatna_stopa, template_putanja, progress_bar)
             rezultati.append((duznik['ime_prezime'], doc_bytes))
         progress_bar.progress((i + 1) / len(duznici))
     return rezultati
-
-def auto_download(doc_bytes, filename):
-    """Automatsko preuzimanje fajla"""
-    b64 = base64.b64encode(doc_bytes.getvalue()).decode()
-    href = f'<a href="data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,{b64}" download="{filename}" id="download-link" style="display:none">Download</a>'
-    st.markdown(href, unsafe_allow_html=True)
-    st.markdown(f"""
-        <script>
-            document.getElementById('download-link').click();
-        </script>
-    """, unsafe_allow_html=True)
 
 # ============================================
 # GLAVNI DEO APLIKACIJE
@@ -320,14 +439,17 @@ def main():
     if uploaded_file is None:
         st.info("👈 **Korak 1:** Izaberite Excel fajl sa leve strane")
         st.markdown("""
-        ### 
-        
         ### Kolone koje program prepoznaje:
-        - **Ime dužnika** (kolona sa rečju 'ime' ili 'duznik')
-        - **Iznos osnovnog duga** (kolona sa rečju 'iznos' ili 'dug')
-        - **Datum naloga** (kolona sa rečju 'datum')
-        - **Ulica** (kolona sa rečju 'ulica' ili 'adresa') - opciono
+        - **Ime dužnika** (kolona sa rečju 'ime' i 'dužnik')
+        - **Iznos osnovnog duga** (kolona sa rečju 'osnovnog' i 'dug')
+        - **Datum naloga** (kolona sa rečju 'datum') - opciono
+        - **Ulica dužnika** (kolona sa rečju 'ulica' ili 'adresa')
+        
+        ### JKP po gradovima:
         """)
+        # Prikaži tabelu JKP po gradovima
+        jkp_df = pd.DataFrame(list(JKP_PO_GRADOVIMA.items()), columns=['Grad', 'JKP'])
+        st.dataframe(jkp_df, use_container_width=True)
         return
     
     excel_file = st.session_state.get('excel_file')
@@ -340,11 +462,13 @@ def main():
     st.header("🏙️ 4. Izaberite grad (sheet)")
     izabrani_sheet = st.selectbox("Grad:", sheets)
     
-    if 'duznici_cache' not in st.session_state or st.session_state.get('last_sheet') != izabrani_sheet:
-        with st.spinner(f"Učitavam dužnike iz {izabrani_sheet}..."):
-            duznici = ucitaj_duznike_iz_sheeta(excel_file, izabrani_sheet)
-            st.session_state['duznici'] = duznici
-            st.session_state['last_sheet'] = izabrani_sheet
+    # Prikaži koji JKP se koristi za ovaj grad
+    jkp_za_grad = JKP_PO_GRADOVIMA.get(izabrani_sheet.upper(), f'JKP "{izabrani_sheet}"')
+    st.info(f"🏢 JKP za {izabrani_sheet}: **{jkp_za_grad}**")
+    
+    with st.spinner(f"Učitavam dužnike iz {izabrani_sheet}..."):
+        duznici = ucitaj_duznike_iz_sheeta(excel_file, izabrani_sheet)
+        st.session_state['duznici'] = duznici
     
     duznici = st.session_state.get('duznici', [])
     
@@ -355,7 +479,7 @@ def main():
     if mode == "Pojedinačni dužnik":
         st.header("👤 5. Izbor dužnika")
         
-        opcije = [f"{d['ime_prezime']} ({izabrani_sheet})" for d in duznici]
+        opcije = [f"{d['ime_prezime']} ({formatiraj_iznos(d['iznos_osnovnog_duga'])})" for d in duznici]
         izabrani_index = st.selectbox("Izaberite dužnika:", range(len(opcije)), format_func=lambda x: opcije[x])
         duznik = duznici[izabrani_index].copy()
         
@@ -364,24 +488,16 @@ def main():
         with col1:
             st.subheader("📋 Podaci iz Excel-a")
             st.write(f"**Ime i prezime:** {duznik['ime_prezime']}")
+            st.write(f"**Iznos osnovnog duga:** {formatiraj_iznos(duznik['iznos_osnovnog_duga'])} RSD")
+            st.write(f"**JKP:** {duznik.get('jkp', 'Nije definisano')}")
             
-            if duznik['iznos_osnovnog_duga'] is None or duznik['iznos_osnovnog_duga'] <= 0:
-                iznos_rucno = st.number_input("Iznos osnovnog duga (RSD):", min_value=0.0, value=1000.0, step=100.0)
-                duznik['iznos_osnovnog_duga'] = iznos_rucno
-                st.info("✏️ Iznos unet ručno")
+            if duznik.get('ulica'):
+                st.write(f"**Ulica:** {duznik['ulica']}")
             else:
-                st.write(f"**Iznos osnovnog duga:** {formatiraj_iznos(duznik['iznos_osnovnog_duga'])} RSD")
-                popravi_iznos = st.checkbox("Popravi iznos ručno")
-                if popravi_iznos:
-                    iznos_rucno = st.number_input("Ispravite iznos (RSD):", min_value=0.0, value=float(duznik['iznos_osnovnog_duga']), step=100.0)
-                    duznik['iznos_osnovnog_duga'] = iznos_rucno
+                st.info("ℹ️ Adresa nije pronađena u Excel-u. Možete je uneti ručno.")
             
             if duznik['datum_naloga']:
                 st.write(f"**Datum naloga:** {duznik['datum_naloga'].strftime('%d.%m.%Y.')}")
-                popravi_datum = st.checkbox("Popravi datum ručno")
-                if popravi_datum:
-                    datum_rucno = st.date_input("Izaberite datum:", value=duznik['datum_naloga'])
-                    duznik['datum_naloga'] = datum_rucno
             else:
                 st.warning("⚠️ Datum naloga nije pronađen!")
                 datum_rucno = st.date_input("Unesite datum naloga:", value=datetime.date.today())
@@ -390,7 +506,8 @@ def main():
         
         with col2:
             st.subheader("🏠 Adresa")
-            ulica = st.text_input("Ulica i broj:", value=duznik.get('ulica', ''), placeholder="Npr. Kralja Petra 10")
+            default_ulica = duznik.get('ulica', '')
+            ulica = st.text_input("Ulica i broj:", value=default_ulica, placeholder="Npr. Kralja Petra 10")
             grad = st.text_input("Grad:", value=izabrani_sheet.upper())
             duznik['ulica'] = ulica
             duznik['grad'] = grad
@@ -429,7 +546,6 @@ def main():
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                         use_container_width=True
                     )
-                    st.info("Kliknite na dugme iznad za preuzimanje.")    
                 else:
                     st.error(f"Greška: {greska}")
     
@@ -439,21 +555,28 @@ def main():
         st.subheader("Izaberite dužnike:")
         
         izabrani_duznici = []
-        for i, d in enumerate(duznici[:100]):  # Ograniči na prvih 100 radi performansi
-            col1, col2 = st.columns([5, 2])
+        for i, d in enumerate(duznici[:100]):
+            col1, col2, col3, col4 = st.columns([5, 2, 2, 2])
             with col1:
-                selected = st.checkbox(f"{d['ime_prezime']} - {formatiraj_iznos(d['iznos_osnovnog_duga']) if d['iznos_osnovnog_duga'] else 'bez iznosa'} RSD", key=f"batch_{i}")
+                selected = st.checkbox(f"{d['ime_prezime']} - {formatiraj_iznos(d['iznos_osnovnog_duga'])} RSD", key=f"batch_{i}")
             with col2:
                 if d['datum_naloga']:
                     st.write(d['datum_naloga'].strftime('%d.%m.%Y.'))
                 else:
                     st.write("bez datuma")
+            with col3:
+                if d.get('ulica'):
+                    st.write("📍 ima adresu")
+                else:
+                    st.write("")
+            with col4:
+                st.write(d.get('jkp', '')[:20] + '...' if len(d.get('jkp', '')) > 20 else d.get('jkp', ''))
             if selected:
                 d['grad'] = izabrani_sheet.upper()
                 izabrani_duznici.append(d)
         
         if len(duznici) > 100:
-            st.info(f"Prikazano prvih 100 od {len(duznici)} dužnika. Za batch sa više dužnika, filtriraj podatke u Excel-u.")
+            st.info(f"Prikazano prvih 100 od {len(duznici)} dužnika.")
         
         if izabrani_duznici:
             st.info(f"Izabrano {len(izabrani_duznici)} dužnika")
