@@ -30,6 +30,13 @@ JKP_PO_GRADOVIMA = {
     
     # Dodaj ostale gradove po potrebi
 }
+POSTANSKI_BROJEVI = {
+    'KRALJEVO': '36000',
+    'VALJEVO': '14000',
+    'LAZAREVAC': '11550',
+    'GORNJI MILANOVAC': '32300',
+    'IVANJICA': '32250',
+}
 
 # ============================================
 # FUNKCIJA ZA OBRAČUN KAMATE
@@ -255,6 +262,8 @@ def ucitaj_duznike_iz_sheeta(excel_file, sheet_name):
         
         # ===== DODAJ JKP ZA OVAJ SHEET =====
         jkp = JKP_PO_GRADOVIMA.get(sheet_name.upper(), f'JKP "{sheet_name}"')
+        # ===== DODAJ POŠTANSKI BROJ ZA OVAJ SHEET =====
+        postanski_broj = POSTANSKI_BROJEVI.get(sheet_name.upper(), '')
         
         duznici = []
         
@@ -319,7 +328,8 @@ def ucitaj_duznike_iz_sheeta(excel_file, sheet_name):
                 'ulica': ulica,
                 'grad': sheet_name.upper(),
                 'sheet': sheet_name,
-                'jkp': jkp  # <--- DODATO JKP
+                'jkp': jkp,  # <--- DODATO JKP\
+                'postanski_broj': postanski_broj,
             })
         
         return duznici
@@ -353,6 +363,7 @@ def generisi_word_duzniku(duznik, kamatna_stopa, template_putanja):
         ulica = duznik.get('ulica', '')
         grad = duznik.get('grad', '')
         jkp = duznik.get('jkp', 'JKP')  # <--- DODATO JKP
+        postanski_broj = duznik.get('postanski_broj', '')
 
         if iznos is None or iznos <= 0:
             return None, "Nedostaje iznos duga"
@@ -370,6 +381,7 @@ def generisi_word_duzniku(duznik, kamatna_stopa, template_putanja):
             'ime_prezime': ime,
             'ulica': ulica if ulica else "_______________",
             'grad': grad,
+            'postanski_broj': postanski_broj,
             'jkp': jkp,  # <--- DODATO JKP
             'iznos_osnovnog_duga': formatiraj_iznos(iznos),
             'datum_naloga': datum_str,
